@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,47 +10,33 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app for Vercel webhook
 app = Flask(__name__)
-
-# Bot token from environment variable
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set")
+    raise RuntimeError("BOT_TOKEN environment variable not set")
 
-# Initialize bot application
-bot_app = Application.builder().token(TOKEN).build()
+# Global application instance (initialized once)
+application = Application.builder().token(TOKEN).build()
 
-# ==================== PARSING LOGIC ====================
+# ------------------- PARSING LOGIC (unchanged, but added persistence) -------------------
 def parse_quiz_from_text(text: str) -> list:
-    """
-    Extract questions, options, correct answer, explanation from .txt file.
-    Returns list of dicts: {question, options, correct_index, explanation}
-    """
-    # Split into question blocks (starting with Q followed by number and dot)
     pattern = r'(Q\d+\.\s.*?)(?=Q\d+\.|\Z)'
     raw_blocks = re.findall(pattern, text, re.DOTALL)
     if not raw_blocks:
-        # Fallback: try splitting by newline patterns
         raw_blocks = re.split(r'\n(?=Q\d+\.)', text)
         raw_blocks = [b.strip() for b in raw_blocks if b.strip()]
 
     quiz = []
     for block in raw_blocks:
-        # Find the separator line containing "😂" or similar emoji
         sep_match = re.search(r'[😂😄😊]', block)
         if not sep_match:
-            continue  # skip if no separator found
-
-        # Question text is everything before the separator
+            continue
         question_text = block[:sep_match.start()].strip()
-        # Options are after separator, up to 'Ex:' or end of block
         after_sep = block[sep_match.end():].strip()
-        # Split into lines and take first 4 non-empty lines as options
         lines = [line.strip() for line in after_sep.split('\n') if line.strip()]
         options = []
         correct_index = None
-        for i, line in enumerate(lines[:4]):  # consider first 4 lines
+        for i, line in enumerate(lines[:4]):
             if '✅' in line:
                 correct_index = i
                 clean_opt = line.replace('✅', '').strip()
@@ -57,19 +44,14 @@ def parse_quiz_from_text(text: str) -> list:
                 clean_opt = line
             options.append(clean_opt)
         if correct_index is None:
-            # fallback: search for ✅ anywhere in options
             for i, opt in enumerate(options):
                 if '✅' in opt:
                     correct_index = i
                     options[i] = opt.replace('✅', '').strip()
                     break
-
-        # Extract explanation (after 'Ex:' or 'Explanation:')
         expl_match = re.search(r'Ex:\s*(.*?)(?=\nQ\d+\.|\Z)', block, re.DOTALL | re.IGNORECASE)
         explanation = expl_match.group(1).strip() if expl_match else "No explanation provided."
-        # Clean extra newlines/spaces
         explanation = re.sub(r'\s+', ' ', explanation)
-
         if len(options) >= 2 and correct_index is not None:
             quiz.append({
                 'question': question_text,
@@ -79,64 +61,99 @@ def parse_quiz_from_text(text: str) -> list:
             })
     return quiz
 
-# ==================== HANDLERS ====================
+# ------------------- PERSISTENCE (using /tmp/quiz_data.json) -------------------
+# Since Vercel may reuse the same instance, we store user data in a JSON file.
+# This is not perfect but works for a personal bot.
+DATA_FILE = "/tmp/quiz_data.json"
+
+def load_user_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            try:
+                return json.load(f)
+            except:
+                return {}
+    return {}
+
+def save_user_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
+
+def get_user_state(user_id):
+    data = load_user_data()
+    return data.get(str(user_id), {})
+
+def set_user_state(user_id, state):
+    data = load_user_data()
+    data[str(user_id)] = state
+    save_user_data(data)
+
+def clear_user_state(user_id):
+    data = load_user_data()
+    if str(user_id) in data:
+        del data[str(user_id)]
+        save_user_data(data)
+
+# ------------------- HANDLERS -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Quiz Bot*\n\n"
-        "1. Send me a `.txt` file with your quiz (questions in the format shown in examples).\n"
+        "1. Send me a `.txt` file with your quiz.\n"
         "2. Use `/start_quiz` to begin.\n"
-        "3. Each question has 4 options. Tap the correct one.\n"
-        "4. Explanation will appear, then press 'Next ➡️'.\n"
-        "5. `/skip` to skip current question.\n"
-        "6. `/reset` to clear current quiz.",
+        "3. Tap an answer → explanation appears → press Next.\n"
+        "4. `/skip` to skip current question.\n"
+        "5. `/reset` to clear current quiz.",
         parse_mode='Markdown'
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     doc = update.message.document
     if not doc.file_name.endswith('.txt'):
         await update.message.reply_text("Please send a .txt file.")
         return
-
     file = await doc.get_file()
     content = await file.download_as_bytearray()
     text = content.decode('utf-8', errors='ignore')
     quiz = parse_quiz_from_text(text)
-
     if not quiz:
-        await update.message.reply_text("❌ No valid questions found. Check file format.")
+        await update.message.reply_text("❌ No valid questions found. Check format (✅ and Ex:).")
         return
-
     if len(quiz) > 300:
-        await update.message.reply_text(f"⚠️ File has {len(quiz)} questions. Limiting to first 300.")
         quiz = quiz[:300]
-
-    context.user_data['quiz'] = quiz
-    context.user_data['current'] = 0
-    context.user_data['score'] = 0
-    context.user_data['answered'] = False
+    # Store in persistent state
+    state = {
+        'quiz': quiz,
+        'current': 0,
+        'score': 0,
+        'answered': False
+    }
+    set_user_state(user_id, state)
     await update.message.reply_text(f"✅ Loaded {len(quiz)} questions. Use /start_quiz to begin.")
 
 async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = context.user_data.get('quiz')
-    if not quiz:
+    user_id = update.effective_user.id
+    state = get_user_state(user_id)
+    if not state or 'quiz' not in state:
         await update.message.reply_text("No quiz loaded. Please send a .txt file first.")
         return
-    context.user_data['current'] = 0
-    context.user_data['score'] = 0
-    context.user_data['answered'] = False
-    await send_question(update, context)
+    state['current'] = 0
+    state['score'] = 0
+    state['answered'] = False
+    set_user_state(user_id, state)
+    await send_question(update, context, user_id)
 
-async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id=None):
+async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int = None):
     if chat_id is None:
         chat_id = update.effective_chat.id
-    quiz = context.user_data.get('quiz')
-    idx = context.user_data.get('current', 0)
+    state = get_user_state(user_id)
+    quiz = state.get('quiz')
+    idx = state.get('current', 0)
     if not quiz or idx >= len(quiz):
-        await context.bot.send_message(chat_id, "🏁 Quiz finished! Final score: {}/{}".format(
-            context.user_data.get('score', 0), len(quiz) if quiz else 0))
+        total = len(quiz) if quiz else 0
+        await context.bot.send_message(chat_id, f"🏁 Quiz finished! Final score: {state.get('score',0)}/{total}")
+        clear_user_state(user_id)
         return
-
     q = quiz[idx]
     text = f"*Q{idx+1}. {q['question']}*\n\n"
     keyboard = []
@@ -144,7 +161,6 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, chat
         label = f"{chr(65+i)}. {opt}"
         callback = f"ans|{idx}|{i}"
         keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
-    # Add a "Skip" button
     keyboard.append([InlineKeyboardButton("⏭️ Skip", callback_data=f"skip|{idx}")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await context.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -152,37 +168,39 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, chat
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
     user_id = update.effective_user.id
-    # Retrieve user_data (store per user using context.user_data; works as long as same user)
-    # Note: In serverless, might be per request but practically okay for personal bot
-    quiz = context.user_data.get('quiz')
-    current_idx = context.user_data.get('current', 0)
+    data = query.data
+    state = get_user_state(user_id)
+    if not state or 'quiz' not in state:
+        await query.edit_message_text("No active quiz. Send a .txt file and /start_quiz")
+        return
+    quiz = state['quiz']
+    current_idx = state['current']
+    answered = state.get('answered', False)
 
     if data.startswith('ans|'):
         _, q_idx, chosen = data.split('|')
         q_idx = int(q_idx)
         chosen = int(chosen)
-        # Prevent answering same question twice
-        if context.user_data.get('answered', False):
+        if answered:
             await query.edit_message_text("You already answered this question. Press Next.")
             return
         if q_idx != current_idx:
-            await query.edit_message_text("Question mismatch. Please use /start_quiz again.")
+            await query.edit_message_text("Question mismatch. Use /start_quiz again.")
             return
         correct = quiz[q_idx]['correct_index']
         if chosen == correct:
-            context.user_data['score'] = context.user_data.get('score', 0) + 1
+            state['score'] = state.get('score', 0) + 1
             result = "✅ Correct!"
         else:
             correct_letter = chr(65 + correct)
             correct_text = quiz[q_idx]['options'][correct]
             result = f"❌ Incorrect. Correct answer: {correct_letter}. {correct_text}"
-        # Show result and explanation in a new message
         explanation = quiz[q_idx]['explanation']
         await query.edit_message_text(f"{result}\n\n📖 *Explanation:* {explanation}", parse_mode='Markdown')
-        context.user_data['answered'] = True
-        # Show Next button
+        state['answered'] = True
+        set_user_state(user_id, state)
+        # Send Next button
         keyboard = [[InlineKeyboardButton("Next ➡️", callback_data=f"next|{q_idx}")]]
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -195,7 +213,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q_idx != current_idx:
             await query.edit_message_text("Skip mismatch. Use /start_quiz.")
             return
-        context.user_data['answered'] = True
+        state['answered'] = True
+        set_user_state(user_id, state)
         await query.edit_message_text("⏭️ Question skipped.")
         keyboard = [[InlineKeyboardButton("Next ➡️", callback_data=f"next|{q_idx}")]]
         await context.bot.send_message(
@@ -209,70 +228,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q_idx != current_idx:
             await query.edit_message_text("Error. Use /start_quiz to reset.")
             return
-        # Move to next question
-        context.user_data['current'] = current_idx + 1
-        context.user_data['answered'] = False
-        await send_question(update, context, chat_id=update.effective_chat.id)
-        await query.delete_message()  # delete the "Next" button message
+        state['current'] = current_idx + 1
+        state['answered'] = False
+        set_user_state(user_id, state)
+        await send_question(update, context, user_id, update.effective_chat.id)
+        try:
+            await query.delete_message()  # Delete the "Next" button message
+        except:
+            pass
     else:
         await query.edit_message_text("Unknown action.")
 
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = context.user_data.get('quiz')
-    current = context.user_data.get('current', 0)
-    if not quiz or current >= len(quiz):
+    user_id = update.effective_user.id
+    state = get_user_state(user_id)
+    if not state or 'quiz' not in state:
         await update.message.reply_text("No active quiz.")
         return
-    context.user_data['answered'] = True
+    state['answered'] = True
+    set_user_state(user_id, state)
     await update.message.reply_text("⏭️ Skipped current question.")
-    # Move to next
-    context.user_data['current'] = current + 1
-    context.user_data['answered'] = False
-    await send_question(update, context)
+    state['current'] = state['current'] + 1
+    state['answered'] = False
+    set_user_state(user_id, state)
+    await send_question(update, context, user_id, update.effective_chat.id)
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    user_id = update.effective_user.id
+    clear_user_state(user_id)
     await update.message.reply_text("🔄 Quiz data cleared. Send a new .txt file and /start_quiz.")
 
 # Register handlers
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(CommandHandler("start_quiz", start_quiz))
-bot_app.add_handler(CommandHandler("skip", skip_command))
-bot_app.add_handler(CommandHandler("reset", reset_command))
-bot_app.add_handler(MessageHandler(filters.Document.TXT, handle_document))
-bot_app.add_handler(CallbackQueryHandler(handle_callback))
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("start_quiz", start_quiz))
+application.add_handler(CommandHandler("skip", skip_command))
+application.add_handler(CommandHandler("reset", reset_command))
+application.add_handler(MessageHandler(filters.Document.TXT, handle_document))
+application.add_handler(CallbackQueryHandler(handle_callback))
 
-# ==================== WEBHOOK (Flask) ====================
+# ------------------- FLASK WEBHOOK (CORRECTED) -------------------
 @app.route("/", methods=["GET"])
 def index():
     return "Quiz Bot is running."
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
-async def webhook():
+async def webhook(token):
+    if token != TOKEN:
+        return jsonify({"status": "unauthorized"}), 403
     try:
-        update = Update.de_json(request.get_json(force=True), bot_app.bot)
-        await bot_app.process_update(update)
+        data = request.get_json(force=True)
+        update = Update.de_json(data, application.bot)
+        # Process the update asynchronously
+        await application.process_update(update)
         return jsonify({"status": "ok"})
     except Exception as e:
         logger.exception("Webhook error")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# Vercel requires this variable
-application = app
+# Initialize the application (this must be done before processing updates)
+@app.before_first_request
+def init_bot():
+    # This runs once when the server starts
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(application.initialize())
 
-# When running locally (optional)
-if __name__ == "__main__":
-    from telegram.ext import Updater
-    import asyncio
-    # Use polling locally for testing
-    updater = Updater(TOKEN)
-    dispatcher = updater.dispatcher
-    # Add same handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("start_quiz", start_quiz))
-    dispatcher.add_handler(CommandHandler("skip", skip_command))
-    dispatcher.add_handler(CommandHandler("reset", reset_command))
-    dispatcher.add_handler(MessageHandler(filters.Document.TXT, handle_document))
-    dispatcher.add_handler(CallbackQueryHandler(handle_callback))
-    updater.start_polling()
-    updater.idle()
+import asyncio
